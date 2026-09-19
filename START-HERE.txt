@@ -1,0 +1,25 @@
+SOCIALPILOT HUB
+===============
+
+1. Install Node.js 20+ and PostgreSQL.
+2. Open two terminals.
+
+BACKEND:
+  cd backend
+  npm install
+  copy .env.example .env
+  npm run dev
+
+FRONTEND:
+  cd frontend
+  npm install
+  npm run dev
+
+Open http://localhost:5173
+
+The dashboard starts with 40 DEMO pages (5 accounts x 8 pages) so you can test
+selection and scheduling immediately.
+
+For real Facebook publishing, configure the Meta developer app and complete the
+official OAuth/API permission setup. The demo scheduler stores jobs in memory;
+connect PostgreSQL and add a production queue/worker before deploying at scale.
