@@ -3,10 +3,12 @@ import {createRoot} from "react-dom/client";
 import "./dashboard.css";
 
 const API = "http://localhost:4000/api";
+const PAGECREW_LOGO = "/pagecrew-logo.png";
 
 type Page = {id:string; name:string; account:string; accountId?:string; pictureUrl?:string};
 type Job = {id:string; content:string; pageIds:string[]; scheduledAt:string; status:string; media?:{mimeType:string; originalName:string}; pageErrors?:Record<string,string>};
 type FacebookAccount = {id:string; name:string; avatarUrl?:string};
+type LinkPreview = {url:string; title:string; description:string; siteName:string; image:string};
 type Profile = {connected:boolean; provider:string; name:string; avatarUrl?:string; accountId?:string; activeAccountId?:string; accounts?:FacebookAccount[]};
 type View = "dashboard" | "pages" | "composer" | "manage-posts";
 
@@ -34,6 +36,9 @@ function App() {
   const [pages,setPages] = useState<Page[]>([]);
   const [selected,setSelected] = useState<string[]>([]);
   const [content,setContent] = useState("");
+  const [linkPreview,setLinkPreview] = useState<LinkPreview | null>(null);
+  const [isLoadingLinkPreview,setIsLoadingLinkPreview] = useState(false);
+  const [linkPreviewError,setLinkPreviewError] = useState("");
   const [scheduleEnabled,setScheduleEnabled] = useState(false);
   const [scheduleDate,setScheduleDate] = useState(() => getCurrentIstDateTimeLocal().slice(0, 10));
   const [scheduleTime,setScheduleTime] = useState(() => getCurrentIstDateTimeLocal().slice(11, 16));
@@ -132,8 +137,39 @@ function App() {
 
   useEffect(() => {
     if (!mediaPreview) return;
+    if (!mediaPreview.startsWith("blob:")) return;
     return () => URL.revokeObjectURL(mediaPreview);
   }, [mediaPreview]);
+
+  useEffect(() => {
+    const candidate = content.match(/https?:\/\/[^\s<>]+/i)?.[0].replace(/[.,!?;:)}\]]+$/, "");
+    setLinkPreview(null);
+    setLinkPreviewError("");
+    if (!candidate) {
+      setIsLoadingLinkPreview(false);
+      return;
+    }
+
+    let active = true;
+    setIsLoadingLinkPreview(true);
+    const timer = window.setTimeout(async () => {
+      try {
+        const response = await fetch(`${API}/posts/link-preview?url=${encodeURIComponent(candidate)}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Preview unavailable.");
+        if (active) setLinkPreview(data);
+      } catch (error) {
+        if (active) setLinkPreviewError(error instanceof Error ? error.message : "Preview unavailable.");
+      } finally {
+        if (active) setIsLoadingLinkPreview(false);
+      }
+    }, 450);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [content]);
 
   useEffect(() => {
     const syncFromHash = () => {
@@ -279,7 +315,9 @@ function App() {
   const connectedAccounts = profile?.accounts || [];
   const activePages = pages.filter((page) => page.accountId === activeAccountId);
   const pageById = new Map<string, Page>(pages.map((page) => [page.id, page]));
+  const editingJob = jobs.find((job) => job.id === editingJobId);
   const previewPage = pages.find((page) => selected.includes(page.id));
+  const contentLink = content.match(/https?:\/\/[^\s<>]+/i)?.[0].replace(/[.,!?;:)}\]]+$/, "");
   const visiblePages = activePages.filter((page) =>
     page.name.toLowerCase().includes(search.toLowerCase()) &&
     (accountFilter === "all" || page.account === accountFilter)
@@ -330,7 +368,8 @@ function App() {
       const scheduleValue = getCurrentIstDateTimeLocal(new Date(job.scheduledAt));
       setScheduleDate(scheduleValue.slice(0, 10));
       setScheduleTime(scheduleValue.slice(11, 16));
-      clearMedia();
+      setMediaFile(null);
+      setMediaPreview(job.media ? `${API}/posts/${job.id}/media` : "");
       navigateTo("composer");
       return;
     }
@@ -341,7 +380,10 @@ function App() {
       let response: Response;
       if (action === "delete") {
         response = await fetch(`${API}/posts/${job.id}`, { method: "DELETE" });
-        if (response.ok) setJobs((current) => current.filter((entry) => entry.id !== job.id));
+        if (response.ok) {
+          setJobs((current) => current.filter((entry) => entry.id !== job.id));
+          setSelectedJobs((current) => current.filter((id) => id !== job.id));
+        }
       } else if (action === "duplicate") {
         response = await fetch(`${API}/posts/${job.id}/duplicate`, { method: "POST" });
         if (response.ok) {
@@ -393,8 +435,8 @@ function App() {
   return <div className="app">
     <aside className="sidebar">
       <button className="brand" type="button" onClick={() => navigateTo("dashboard")}>
-        <span className="brand-icon">SP</span>
-        <span><strong>SocialPilot Hub</strong><small>One post. Every page.</small></span>
+        <img className="brand-icon" src={PAGECREW_LOGO} alt="PageCrew logo" />
+        <span><strong>PageCrew</strong><small>a crew handling all your pages</small></span>
       </button>
       <p className="nav-title">Workspace</p>
       <nav className="nav" aria-label="Main navigation">
@@ -517,9 +559,15 @@ function App() {
                     <span><strong>{previewPage?.name || "Your Facebook Page"}</strong><small>Just now · Public</small></span>
                   </header>
                   {content.trim() && <p className="preview-copy">{content}</p>}
-                  {mediaPreview && (mediaFile?.type.startsWith("video/")
+                  {mediaPreview && ((mediaFile?.type || editingJob?.media?.mimeType || "").startsWith("video/")
                     ? <video className="preview-media" src={mediaPreview} controls />
                     : <img className="preview-media" src={mediaPreview} alt="Post attachment preview" />)}
+                  {isLoadingLinkPreview && <p className="link-preview-status">Loading link preview...</p>}
+                  {linkPreview && <a className="link-preview-card" href={linkPreview.url} target="_blank" rel="noopener noreferrer">
+                    {linkPreview.image && <img className="link-preview-image" src={linkPreview.image} alt="" />}
+                    <span className="link-preview-copy"><small>{linkPreview.siteName}</small><strong>{linkPreview.title}</strong>{linkPreview.description && <span>{linkPreview.description}</span>}<em>Open link ↗</em></span>
+                  </a>}
+                  {!isLoadingLinkPreview && linkPreviewError && contentLink && <a className="link-preview-fallback" href={contentLink} target="_blank" rel="noopener noreferrer">Open link in new tab ↗</a>}
                   <footer className="preview-actions"><span>Like</span><span>Comment</span><span>Share</span></footer>
                 </article>
                 </aside>
@@ -531,6 +579,8 @@ function App() {
             <div className="recent-list">
               {actionFeedback && <p className="post-action-feedback" role="status">{actionFeedback}</p>}
               {recentJobs.map((job) => <article className="recent-row" key={job.id}>
+                <input className="recent-select" type="checkbox" aria-label={`Select post ${job.content.slice(0, 32)}`} checked={selectedJobs.includes(job.id)} onChange={() => setSelectedJobs((current) => current.includes(job.id) ? current.filter((id) => id !== job.id) : [...current, job.id])} />
+                {job.media?.mimeType.startsWith("image/") ? <img className="recent-thumb" src={`${API}/posts/${job.id}/media`} alt={job.media.originalName} /> : <span className="recent-thumb recent-thumb-text">{job.content.trim().slice(0, 2).toUpperCase() || "P"}</span>}
                 <span className="recent-post-copy"><strong>{job.content.trim() || job.media?.originalName || "Untitled post"}</strong><small>{job.pageIds.length} {job.pageIds.length === 1 ? "page" : "pages"} · {formatIst(job.scheduledAt)}</small></span>
                 <span className="recent-row-actions"><span className={`status ${job.status}`}>{job.status}</span>{postActions(job)}</span>
               </article>)}
@@ -571,7 +621,7 @@ function App() {
                   return <React.Fragment key={job.id}>
                     <tr>
                       <td className="select-column"><input type="checkbox" aria-label={`Select post ${job.content.slice(0, 32)}`} checked={selectedJobs.includes(job.id)} onChange={() => setSelectedJobs((current) => current.includes(job.id) ? current.filter((id) => id !== job.id) : [...current, job.id])} /></td>
-                      <td><div className="managed-post"><span className="post-thumb">{job.content.trim().slice(0, 2).toUpperCase() || "P"}</span><span><strong>{job.content}</strong><small>Text post</small></span></div></td>
+                      <td><div className="managed-post">{job.media?.mimeType.startsWith("image/") ? <img className="post-thumb post-thumb-image" src={`${API}/posts/${job.id}/media`} alt={job.media.originalName} /> : <span className="post-thumb">{job.content.trim().slice(0, 2).toUpperCase() || "P"}</span>}<span><strong>{job.content || job.media?.originalName}</strong><small>{job.media?.originalName || "Text post"}</small></span></div></td>
                       <td>{job.pageIds.length} {job.pageIds.length === 1 ? "page" : "pages"}</td>
                       <td>{formatIst(job.scheduledAt)}</td>
                       <td><span className={`status ${job.status}`}>{job.status}</span></td>

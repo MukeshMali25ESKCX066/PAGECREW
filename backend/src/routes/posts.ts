@@ -1,6 +1,8 @@
-import { mkdirSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync } from "node:fs";
 import { copyFile, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import { extname, resolve } from "node:path";
 import { NextFunction, Request, Response, Router } from "express";
 import multer from "multer";
@@ -69,6 +71,97 @@ async function removeUploadedMedia(media?: StoredMedia) {
   if (media) await unlink(media.path).catch(() => undefined);
 }
 
+function isPublicAddress(address: string) {
+  const version = isIP(address);
+  if (version === 4) {
+    const [first, second, third] = address.split(".").map(Number);
+    return !(first === 0 || first === 10 || first === 127 || first >= 224 ||
+      (first === 169 && second === 254) ||
+      (first === 172 && second >= 16 && second <= 31) ||
+      (first === 192 && second === 168) ||
+      (first === 192 && second === 0 && third === 0) ||
+      (first === 198 && (second === 18 || second === 19 || second === 51)) ||
+      (first === 203 && second === 0 && third === 113) ||
+      (first === 100 && second >= 64 && second <= 127));
+  }
+  if (version === 6) {
+    const normalized = address.toLowerCase();
+    return !(normalized === "::" || normalized === "::1" || normalized.startsWith("::ffff:") ||
+      normalized.startsWith("fc") || normalized.startsWith("fd") || normalized.startsWith("fe8") ||
+      normalized.startsWith("fe9") || normalized.startsWith("fea") || normalized.startsWith("feb") ||
+      normalized.startsWith("ff") || normalized.startsWith("2001:db8:"));
+  }
+  return false;
+}
+
+async function isPublicHost(hostname: string) {
+  const host = hostname.toLowerCase().replace(/\.$/, "");
+  if (!host || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return false;
+  if (isIP(host)) return isPublicAddress(host);
+  try {
+    const addresses = await lookup(host, {all: true, verbatim: true});
+    return addresses.length > 0 && addresses.every(({address}) => isPublicAddress(address));
+  } catch {
+    return false;
+  }
+}
+
+async function fetchPreviewHtml(startUrl: URL) {
+  let url = startUrl;
+  for (let redirects = 0; redirects <= 3; redirects += 1) {
+    if (!(url.protocol === "http:" || url.protocol === "https:") || url.username || url.password || !await isPublicHost(url.hostname)) {
+      throw new Error("Only public web links can be previewed.");
+    }
+    const response = await fetch(url, {
+      redirect: "manual",
+      signal: AbortSignal.timeout(6000),
+      headers: {accept: "text/html", "user-agent": "SocialPilotHubLinkPreview/1.0"}
+    });
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get("location");
+      if (!location || redirects === 3) throw new Error("The link redirected too many times.");
+      url = new URL(location, url);
+      continue;
+    }
+    if (!response.ok || !response.headers.get("content-type")?.includes("text/html")) {
+      throw new Error("This link does not provide a page preview.");
+    }
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("The link preview is empty.");
+    const chunks: Buffer[] = [];
+    let size = 0;
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > 1_000_000) {
+        await reader.cancel();
+        throw new Error("The page is too large to preview.");
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return {html: Buffer.concat(chunks).toString("utf8"), url: url.toString()};
+  }
+  throw new Error("The link could not be previewed.");
+}
+
+function decodeHtml(value: string) {
+  return value.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+}
+
+function readMetaValue(html: string, keys: string[]) {
+  for (const tag of html.match(/<meta\b[^>]*>/gi) || []) {
+    const attributes = new Map<string, string>();
+    for (const match of tag.matchAll(/([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g)) {
+      attributes.set(match[1].toLowerCase(), decodeHtml(match[2] ?? match[3] ?? match[4] ?? ""));
+    }
+    const key = (attributes.get("property") || attributes.get("name") || "").toLowerCase();
+    const value = attributes.get("content");
+    if (value && keys.includes(key)) return value.slice(0, 500);
+  }
+  return "";
+}
+
 async function publishJob(job: Job) {
   let publishedCount = 0;
   const pageErrors: Record<string, string> = {};
@@ -104,7 +197,6 @@ export async function refreshScheduledJobs() {
   for (const job of jobs) {
     if (job.status !== "scheduled" || new Date(job.scheduledAt).getTime() > now) continue;
     await publishJob(job);
-    await removeUploadedMedia(job.media);
   }
 }
 
@@ -130,6 +222,44 @@ function createJob(content: string, pageIds: string[], status: Job["status"], sc
 router.get("/", async (_req, res) => {
   await refreshScheduledJobs();
   res.json(jobs.map(publicJob));
+});
+
+router.get("/link-preview", async (req, res) => {
+  const rawUrl = typeof req.query.url === "string" ? req.query.url : "";
+  try {
+    const {html, url} = await fetchPreviewHtml(new URL(rawUrl));
+    const pageUrl = new URL(url);
+    const title = readMetaValue(html, ["og:title", "twitter:title"]) || decodeHtml(html.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.replace(/<[^>]*>/g, "").trim() || pageUrl.hostname).slice(0, 200);
+    const description = readMetaValue(html, ["og:description", "twitter:description", "description"]);
+    const siteName = readMetaValue(html, ["og:site_name"]) || pageUrl.hostname;
+    const rawImage = readMetaValue(html, ["og:image", "twitter:image"]);
+    let image = "";
+    if (rawImage) {
+      const imageUrl = new URL(rawImage, pageUrl);
+      if ((imageUrl.protocol === "http:" || imageUrl.protocol === "https:") && await isPublicHost(imageUrl.hostname)) {
+        image = imageUrl.toString();
+      }
+    }
+    res.json({url, title, description, siteName, image});
+  } catch (error) {
+    res.status(400).json({error: error instanceof Error ? error.message : "The link could not be previewed."});
+  }
+});
+
+router.get("/:id/media", (req, res) => {
+  const job = jobs.find((entry) => entry.id === req.params.id);
+  if (!job?.media || !existsSync(job.media.path)) {
+    res.status(404).json({error: "Post media not found"});
+    return;
+  }
+  res.setHeader("Content-Type", job.media.mimeType);
+  res.setHeader("Cache-Control", "private, max-age=3600");
+  const mediaStream = createReadStream(job.media.path);
+  mediaStream.on("error", () => {
+    if (!res.headersSent) res.status(404).json({error: "Post media not found"});
+    else res.destroy();
+  });
+  mediaStream.pipe(res);
 });
 
 router.post("/schedule", handleMediaUpload, async (req, res) => {
@@ -178,7 +308,6 @@ router.post("/publish", handleMediaUpload, async (req, res) => {
   const job = createJob(content, pageIds, "scheduled", new Date().toISOString(), req.file);
   jobs.push(job);
   await publishJob(job);
-  await removeUploadedMedia(job.media);
   res.status(201).json(publicJob(job));
 });
 
@@ -215,7 +344,6 @@ router.patch("/:id", handleMediaUpload, async (req, res) => {
     job.scheduledAt = status === "publish" ? new Date().toISOString() : parsedDate.toISOString();
     if (status === "publish") {
       await publishJob(job);
-      await removeUploadedMedia(job.media);
     } else {
       await refreshScheduledJobs();
     }

@@ -180,6 +180,44 @@ test("supports post draft, update, duplicate, and delete actions", async () => {
   }
 });
 
+test("serves stored post media and rejects private link preview targets", async () => {
+  jobs.length = 0;
+  jobs.push({
+    id: "media-preview-test",
+    content: "Photo post",
+    pageIds: [],
+    scheduledAt: new Date().toISOString(),
+    status: "draft",
+    media: {
+      path: resolve(process.cwd(), "uploads", ".gitignore"),
+      mimeType: "image/png",
+      originalName: "photo.png"
+    }
+  });
+  const app = express();
+  app.use("/api/posts", postsRouter);
+  const server = app.listen(0);
+  await new Promise<void>((resolve, reject) => {
+    server.once("listening", resolve);
+    server.once("error", reject);
+  });
+  const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api/posts`;
+
+  try {
+    const mediaResponse = await fetch(`${baseUrl}/media-preview-test/media`);
+    assert.equal(mediaResponse.status, 200);
+    assert.equal(mediaResponse.headers.get("content-type"), "image/png");
+    assert.ok((await mediaResponse.arrayBuffer()).byteLength > 0);
+
+    const previewResponse = await fetch(`${baseUrl}/link-preview?url=${encodeURIComponent("http://127.0.0.1/")}`);
+    assert.equal(previewResponse.status, 400);
+  } finally {
+    jobs.length = 0;
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
 test("keeps multi-page jobs alive when one page fails but another succeeds", async () => {
   jobs.length = 0;
   pageAccessTokens["page-1"] = "page-token-1";
