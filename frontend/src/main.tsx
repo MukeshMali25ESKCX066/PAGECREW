@@ -2,7 +2,7 @@ import React, {useEffect, useState} from "react";
 import {createRoot} from "react-dom/client";
 import "./dashboard.css";
 
-const API = "http://localhost:4000/api";
+const API = import.meta.env.VITE_API_URL || "http://localhost:4000/api";
 const PAGECREW_LOGO = "/pagecrew-logo.png";
 
 type Page = {id:string; name:string; account:string; accountId?:string; pictureUrl?:string};
