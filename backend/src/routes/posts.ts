@@ -6,7 +6,8 @@ import { isIP } from "node:net";
 import { extname, resolve } from "node:path";
 import { NextFunction, Request, Response, Router } from "express";
 import multer from "multer";
-import { pageAccessTokens } from "./pages.js";
+import { getWorkspaceScopeId } from "./auth.js";
+import { pageAccessTokens, pageTokenKey } from "./pages.js";
 import { PublishMedia, publishToPage } from "../services/meta.js";
 const router = Router();
 
@@ -53,6 +54,7 @@ function handleMediaUpload(req: Request, res: Response, next: NextFunction) {
 type StoredMedia = PublishMedia & { originalName: string };
 type Job = {
   id: string; content: string; pageIds: string[]; scheduledAt: string;
+  ownerScopeId: string;
   status: "draft"|"scheduled"|"published"|"failed"|"partial";
   media?: StoredMedia;
   pageErrors?: Record<string, string>;
@@ -60,11 +62,26 @@ type Job = {
 
 export const jobs: Job[] = [];
 
-function publicJob({ media, ...job }: Job) {
+function publicJob({ media, ownerScopeId: _ownerScopeId, ...job }: Job) {
   return {
     ...job,
     ...(media ? { media: { mimeType: media.mimeType, originalName: media.originalName } } : {})
   };
+}
+
+function requireWorkspaceScope(req: Request, res: Response, next: NextFunction) {
+  void getWorkspaceScopeId(req).then((workspaceScopeId) => {
+    if (!workspaceScopeId) {
+      res.status(401).json({ error: "Approved PageCrew login is required." });
+      return;
+    }
+    res.locals.workspaceScopeId = workspaceScopeId;
+    next();
+  }).catch(next);
+}
+
+function getRequiredWorkspaceScope(res: Response) {
+  return res.locals.workspaceScopeId as string;
 }
 
 async function removeUploadedMedia(media?: StoredMedia) {
@@ -167,7 +184,7 @@ async function publishJob(job: Job) {
   const pageErrors: Record<string, string> = {};
 
   for (const pageId of job.pageIds) {
-    const pageToken = pageAccessTokens[pageId];
+    const pageToken = pageAccessTokens[pageTokenKey(job.ownerScopeId, pageId)];
     if (!pageToken) {
       pageErrors[pageId] = "No Page access token. Reconnect Facebook and reload your Pages.";
       continue;
@@ -191,10 +208,11 @@ async function publishJob(job: Job) {
   }
 }
 
-export async function refreshScheduledJobs() {
+export async function refreshScheduledJobs(ownerScopeId?: string) {
   const now = Date.now();
 
   for (const job of jobs) {
+    if (ownerScopeId && job.ownerScopeId !== ownerScopeId) continue;
     if (job.status !== "scheduled" || new Date(job.scheduledAt).getTime() > now) continue;
     await publishJob(job);
   }
@@ -211,17 +229,18 @@ function readPageIds(value: unknown): string[] | null {
   return Array.isArray(value) && value.every((id) => typeof id === "string") ? [...new Set(value)] : null;
 }
 
-function createJob(content: string, pageIds: string[], status: Job["status"], scheduledAt: string, file?: Express.Multer.File): Job {
+function createJob(content: string, pageIds: string[], status: Job["status"], scheduledAt: string, ownerScopeId: string, file?: Express.Multer.File): Job {
   const media = file ? { path: file.path, mimeType: file.mimetype, originalName: file.originalname } : undefined;
   return {
-    id: randomUUID(), content, pageIds, scheduledAt, status,
+    id: randomUUID(), content, pageIds, scheduledAt, ownerScopeId, status,
     ...(media ? { media } : {})
   };
 }
 
-router.get("/", async (_req, res) => {
-  await refreshScheduledJobs();
-  res.json(jobs.map(publicJob));
+router.get("/", requireWorkspaceScope, async (_req, res) => {
+  const ownerScopeId = getRequiredWorkspaceScope(res);
+  await refreshScheduledJobs(ownerScopeId);
+  res.json(jobs.filter((job) => job.ownerScopeId === ownerScopeId).map(publicJob));
 });
 
 router.get("/link-preview", async (req, res) => {
@@ -246,8 +265,9 @@ router.get("/link-preview", async (req, res) => {
   }
 });
 
-router.get("/:id/media", (req, res) => {
-  const job = jobs.find((entry) => entry.id === req.params.id);
+router.get("/:id/media", requireWorkspaceScope, (req, res) => {
+  const ownerScopeId = getRequiredWorkspaceScope(res);
+  const job = jobs.find((entry) => entry.id === req.params.id && entry.ownerScopeId === ownerScopeId);
   if (!job?.media || !existsSync(job.media.path)) {
     res.status(404).json({error: "Post media not found"});
     return;
@@ -262,7 +282,8 @@ router.get("/:id/media", (req, res) => {
   mediaStream.pipe(res);
 });
 
-router.post("/schedule", handleMediaUpload, async (req, res) => {
+router.post("/schedule", requireWorkspaceScope, handleMediaUpload, async (req, res) => {
+  const ownerScopeId = getRequiredWorkspaceScope(res);
   const content = typeof req.body.content === "string" ? req.body.content : "";
   const scheduledAt = typeof req.body.scheduledAt === "string" ? req.body.scheduledAt : "";
   const pageIds = readPageIds(req.body.pageIds);
@@ -278,13 +299,14 @@ router.post("/schedule", handleMediaUpload, async (req, res) => {
     return res.status(400).json({ error: "scheduledAt must be a valid date" });
   }
 
-  const job = createJob(content, pageIds, "scheduled", parsedDate.toISOString(), req.file);
+  const job = createJob(content, pageIds, "scheduled", parsedDate.toISOString(), ownerScopeId, req.file);
   jobs.push(job);
-  await refreshScheduledJobs();
+  await refreshScheduledJobs(ownerScopeId);
   res.status(201).json(publicJob(job));
 });
 
-router.post("/draft", handleMediaUpload, async (req, res) => {
+router.post("/draft", requireWorkspaceScope, handleMediaUpload, async (req, res) => {
+  const ownerScopeId = getRequiredWorkspaceScope(res);
   const content = typeof req.body.content === "string" ? req.body.content : "";
   const pageIds = readPageIds(req.body.pageIds);
   if ((!content.trim() && !req.file) || !pageIds) {
@@ -292,12 +314,13 @@ router.post("/draft", handleMediaUpload, async (req, res) => {
     return res.status(400).json({ error: "content or media and valid pageIds are required" });
   }
 
-  const job = createJob(content, pageIds, "draft", new Date().toISOString(), req.file);
+  const job = createJob(content, pageIds, "draft", new Date().toISOString(), ownerScopeId, req.file);
   jobs.push(job);
   res.status(201).json(publicJob(job));
 });
 
-router.post("/publish", handleMediaUpload, async (req, res) => {
+router.post("/publish", requireWorkspaceScope, handleMediaUpload, async (req, res) => {
+  const ownerScopeId = getRequiredWorkspaceScope(res);
   const content = typeof req.body.content === "string" ? req.body.content : "";
   const pageIds = readPageIds(req.body.pageIds);
   if ((!content.trim() && !req.file) || !pageIds?.length) {
@@ -305,14 +328,15 @@ router.post("/publish", handleMediaUpload, async (req, res) => {
     return res.status(400).json({ error: "content or media and at least one pageId are required" });
   }
 
-  const job = createJob(content, pageIds, "scheduled", new Date().toISOString(), req.file);
+  const job = createJob(content, pageIds, "scheduled", new Date().toISOString(), ownerScopeId, req.file);
   jobs.push(job);
   await publishJob(job);
   res.status(201).json(publicJob(job));
 });
 
-router.patch("/:id", handleMediaUpload, async (req, res) => {
-  const job = jobs.find((entry) => entry.id === req.params.id);
+router.patch("/:id", requireWorkspaceScope, handleMediaUpload, async (req, res) => {
+  const ownerScopeId = getRequiredWorkspaceScope(res);
+  const job = jobs.find((entry) => entry.id === req.params.id && entry.ownerScopeId === ownerScopeId);
   const status = req.body.status;
   if (!job || !["draft", "scheduled", "publish"].includes(status)) {
     if (req.file) await removeUploadedMedia({ path: req.file.path, mimeType: req.file.mimetype, originalName: req.file.originalname });
@@ -345,18 +369,19 @@ router.patch("/:id", handleMediaUpload, async (req, res) => {
     if (status === "publish") {
       await publishJob(job);
     } else {
-      await refreshScheduledJobs();
+      await refreshScheduledJobs(ownerScopeId);
     }
   }
 
   res.json(publicJob(job));
 });
 
-router.post("/:id/duplicate", async (req, res) => {
-  const source = jobs.find((entry) => entry.id === req.params.id);
+router.post("/:id/duplicate", requireWorkspaceScope, async (req, res) => {
+  const ownerScopeId = getRequiredWorkspaceScope(res);
+  const source = jobs.find((entry) => entry.id === req.params.id && entry.ownerScopeId === ownerScopeId);
   if (!source) return res.status(404).json({ error: "Post not found" });
 
-  const duplicate = createJob(source.content, [...source.pageIds], "draft", new Date().toISOString());
+  const duplicate = createJob(source.content, [...source.pageIds], "draft", new Date().toISOString(), ownerScopeId);
   if (source.media) {
     const mediaPath = resolve(mediaDirectory, `${randomUUID()}${extname(source.media.path)}`);
     try {
@@ -368,8 +393,9 @@ router.post("/:id/duplicate", async (req, res) => {
   res.status(201).json(publicJob(duplicate));
 });
 
-router.delete("/:id", async (req, res) => {
-  const index = jobs.findIndex((entry) => entry.id === req.params.id);
+router.delete("/:id", requireWorkspaceScope, async (req, res) => {
+  const ownerScopeId = getRequiredWorkspaceScope(res);
+  const index = jobs.findIndex((entry) => entry.id === req.params.id && entry.ownerScopeId === ownerScopeId);
   if (index < 0) return res.status(404).json({ error: "Post not found" });
   const [job] = jobs.splice(index, 1);
   await removeUploadedMedia(job.media);

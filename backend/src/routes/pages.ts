@@ -1,16 +1,26 @@
 import { Router } from "express";
-import { getFacebookAccount } from "./auth.js";
+import { getFacebookAccount, getWorkspaceScopeId } from "./auth.js";
 const router = Router();
 
 export const pageAccessTokens: Record<string, string> = {};
 
-export function clearPageAccessTokens() {
+export function pageTokenKey(workspaceScopeId: string, pageId: string) {
+  return `${workspaceScopeId}:${pageId}`;
+}
+
+export function clearPageAccessTokens(workspaceScopeId?: string) {
   for (const key of Object.keys(pageAccessTokens)) {
-    delete pageAccessTokens[key];
+    if (!workspaceScopeId || key.startsWith(`${workspaceScopeId}:`)) delete pageAccessTokens[key];
   }
 }
 
 router.get("/", async (req, res) => {
+  const workspaceScopeId = await getWorkspaceScopeId(req);
+  if (!workspaceScopeId) {
+    res.status(401).json({ error: "Approved PageCrew login is required." });
+    return;
+  }
+
   const accountId = typeof req.query.accountId === "string" ? req.query.accountId : undefined;
   if (process.env.DEMO_MODE === "true") {
     const demoPages = Array.from({length: 40}, (_, i) => {
@@ -27,7 +37,7 @@ router.get("/", async (req, res) => {
     return;
   }
 
-  const account = getFacebookAccount(accountId);
+  const account = getFacebookAccount(accountId, workspaceScopeId);
   if (account?.accessToken) {
     try {
       const params = new URLSearchParams({
@@ -43,7 +53,7 @@ router.get("/", async (req, res) => {
       }
 
       for (const page of data.data || []) {
-        pageAccessTokens[page.id] = page.access_token;
+        pageAccessTokens[pageTokenKey(workspaceScopeId, page.id)] = page.access_token;
       }
 
       res.json((data.data || []).map((page) => ({
