@@ -657,7 +657,8 @@ function ensureSessionId(req: Pick<Request, "headers">, res: Pick<Response, "coo
   if (!getSessionIdFromRequest(req)) {
     res.cookie(SESSION_COOKIE_NAME, sessionId, {
       httpOnly: true,
-      sameSite: "lax",
+      secure: true,
+      sameSite: "none",
       path: "/",
       maxAge: 30 * 24 * 60 * 60 * 1000
     });
@@ -1159,7 +1160,7 @@ router.post("/payment/submit", requireSignedInUser, handlePaymentUpload("screens
   const payerName = typeof req.body.payerName === "string" ? req.body.payerName.trim() : "";
   if (reference.length < 6 || reference.length > 100 || payerName.length < 2 || payerName.length > 150) {
     await unlink(req.file.path).catch(() => undefined);
-    res.status(400).json({ error: "Enter the payer name and a valid transaction reference (6–100 characters)." });
+    res.status(400).json({ error: "Enter the payer name and a valid transaction reference (6â€“100 characters)." });
     return;
   }
 
@@ -1253,7 +1254,7 @@ router.post("/admin/reject-payment", async (req, res) => {
   const userId = typeof req.body.userId === "string" ? req.body.userId : "";
   const reason = typeof req.body.reason === "string" ? req.body.reason.trim() : "";
   if (!userId || reason.length < 3 || reason.length > 500) {
-    res.status(400).json({ error: "User ID and a rejection reason (3–500 characters) are required." });
+    res.status(400).json({ error: "User ID and a rejection reason (3â€“500 characters) are required." });
     return;
   }
   const targetUser = await getUserById(userId);
